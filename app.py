@@ -10,6 +10,8 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
+from reportlab.platypus import Paragraph
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 # ---------------------------------------------------------------------------
 # Location / station constants for Santa Cruz Harbor
@@ -253,14 +255,21 @@ def fetch_advisory():
         r = requests.get(url, headers={"User-Agent": "(scyc-web-tool)"}, timeout=10)
         features = r.json().get("features", [])
         matched = []
+        full_descriptions = []
         keywords = ("small craft", "gale", "storm warning", "dense fog", "fog advisory", "high surf", "swell")
         for f in features:
-            event = f.get("properties", {}).get("event", "")
+            props = f.get("properties", {})
+            event = props.get("event", "")
             if any(kw in event.lower() for kw in keywords) and event not in matched:
                 matched.append(event)
-        return ("Y", "; ".join(matched)) if matched else ("N", None)
+                desc = props.get("description", "No detailed description available.")
+                full_descriptions.append(f"=== {event} ===\n{desc}")
+        
+        if matched:
+            return "Y", "; ".join(matched), "\n\n".join(full_descriptions)
+        return "N", None, None
     except Exception:
-        return None, None
+        return None, None, None
 
 def evaluate(level, class_name, wind_harbor, sounding, advisory, wave_state, returning_ok, aqi):
     c = CRITERIA[level]
@@ -296,6 +305,7 @@ def build_pdf(target, data_dict, checks, all_met):
     x0 = 0.6 * inch
     y = H - 0.6 * inch
 
+    # --- PAGE 1: PRIMARY CHECKLIST ---
     c.setFont("Helvetica-Bold", 16)
     c.drawString(x0, y, "Harbor Exit Checklist & Approval")
     c.setFont("Helvetica", 9)
@@ -417,6 +427,38 @@ def build_pdf(target, data_dict, checks, all_met):
     y -= 16
     c.setFont("Helvetica-Oblique", 7)
     c.drawString(x0, y, f"Auto-generated {datetime.now().strftime('%m/%d/%Y %I:%M %p')} | Harbor_Exit_Procedure_v_4")
+
+    # --- PAGE 2: DETAILED NWS ADVISORY TEXT ---
+    if data_dict.get("advisory_full_text"):
+        c.showPage()  # Commit Page 1 and generate Page 2 canvas
+        y_p2 = H - 0.6 * inch
+        
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(x0, y_p2, "Official National Weather Service Advisory Text")
+        y_p2 -= 8
+        c.setLineWidth(1)
+        c.line(x0, y_p2, W - x0, y_p2)
+        y_p2 -= 20
+        
+        # Configure wrapping paragraph styling container rules
+        styles = getSampleStyleSheet()
+        alert_style = ParagraphStyle(
+            'NWSAlertStyle',
+            parent=styles['Normal'],
+            fontName='Courier',
+            fontSize=9.5,
+            leading=13,
+            textColor=colors.HexColor("#222222")
+        )
+        
+        # Format clean spacing layouts for paragraphs
+        formatted_text = data_dict["advisory_full_text"].replace("\n", "<br/>")
+        p = Paragraph(formatted_text, alert_style)
+        
+        # Draw paragraph bound to specific width dimensions
+        p.wrapOn(c, W - 2*x0, H - 2*inch)
+        p.drawOn(c, x0, y_p2 - p.height)
+
     c.save()
 
 # ---------------------------------------------------------------------------
@@ -426,7 +468,6 @@ st.set_page_config(page_title="SCYC Harbor Exit Tool", page_icon="⛵", layout="
 
 st.title("⛵ SCYC Harbor Exit Checklist")
 
-# Official Santa Cruz Harbor Resource Links
 st.markdown("""
 **Official Harbor Links:**
 * 📏 [Santa Cruz Harbor Entrance Soundings](https://www.santacruzharbor.org/entrance-sounding)
@@ -434,7 +475,6 @@ st.markdown("""
 ---
 """)
 
-# Primary Input Forms
 col1, col2 = st.columns(2)
 with col1:
     boat_class = st.selectbox("Boat Class", list(CLASS_TO_LEVEL_DEFAULT.keys()))
@@ -447,26 +487,22 @@ with col2:
 
 wave_state = st.selectbox("Wave State at Harbor Mouth", ["none", "half", "full"], index=0)
 
-# Expandable Manual Fallbacks for Network Dropouts
 with st.expander("⚠️ Manual API Overrides (Use if Government Servers Timeout)"):
     st.markdown("*Leave these empty to allow the script to automatically fetch live environmental data.*")
     m_high_tide = st.text_input("Manual High Tide Time & Height (e.g., 11:30 AM / 4.5 ft)")
     m_low_tide = st.text_input("Manual Low Tide Time & Height (e.g., 5:15 PM / -0.2 ft)")
     m_ret_tide = st.text_input("Manual Tide Height at Return Time (ft)", value="")
 
-# Processing Action Execution Loop
 if st.button("Generate Checklist PDF", type="primary"):
     date_str = sailing_date.strftime("%m/%d/%Y")
     level = CLASS_TO_LEVEL_DEFAULT[boat_class]
     exiting_bool = True if exiting_plan == "Exiting Harbor" else False
 
     with st.spinner("Fetching live marine data endpoints..."):
-        # 1. Handle Tide Predictions
         tide_events = fetch_tide_data(date_str)
         tide = parse_tide_summary(tide_events, date_str, leave_time, return_time)
         tide_at_return = estimate_tide_at(tide_events, date_str, return_time)
         
-        # Inject Overrides if provided
         if m_high_tide:
             tide["high_time"], tide["high_ft"] = m_high_tide.split("/") if "/" in m_high_tide else (m_high_tide, "Unknown")
         if m_low_tide:
@@ -478,24 +514,19 @@ if st.button("Generate Checklist PDF", type="primary"):
         if not tide_events and not m_high_tide:
             st.warning("⚠️ NOAA Tide API timed out. Consider filling out the Manual Overrides menu above.")
 
-        # 2. Wind Windows
         wind_harbor = fetch_wind_window(date_str, leave_time, return_time)
         wind_buoy = wind_harbor
-
-        # 3. Air Quality
         aqi = fetch_aqi()
+        
+        # Grab active alert headers and the full body paragraphs from NWS
+        adv_yn, adv_type, advisory_full_text = fetch_advisory()
 
-        # 4. Marine Advisories
-        adv_yn, adv_type = fetch_advisory()
-
-        # 5. Offshore Marine Swells
         wf = fetch_marine_swell_api(date_str, leave_time, return_time)
         wf_return = wf.get("return") or {}
         swell_dir = wf_return.get("wave_dir", "W")
         swell_height = wf_return.get("wave_height_ft", 3.0)
         swell_period = wf_return.get("wave_period", 10.0)
 
-        # 6. Safety Evaluations
         returning_ok = None
         if tide_at_return is not None:
             returning_ok = (sounding_input + tide_at_return) > 8.0 if level == "advanced" else tide_at_return >= 0
@@ -503,11 +534,9 @@ if st.button("Generate Checklist PDF", type="primary"):
             returning_ok = tide["absolute_low_day_ft"] >= 0
 
         checks = evaluate(level, boat_class, wind_harbor, sounding_input, adv_yn, wave_state, returning_ok, aqi)
-        
         values = [met for _, met in checks]
         all_met = False if any(v is False for v in values) else (None if any(v is None for v in values) else True)
 
-        # Compile Consolidated Data Payload for Canvas Context
         payload = {
             "date": date_str, "boat_class": boat_class, "level": level, "leave": leave_time, "ret": return_time,
             "exiting": exiting_bool, "sounding": sounding_input, "wave_state": wave_state,
@@ -515,26 +544,33 @@ if st.button("Generate Checklist PDF", type="primary"):
             "high_time": tide.get("high_time"), "high_ft": tide.get("high_ft"),
             "low_time": tide.get("low_time"), "low_ft": tide.get("low_ft"),
             "tide_at_return": tide_at_return, "advisory": adv_yn, "advisory_type": adv_type,
+            "advisory_full_text": advisory_full_text,
             "swell_dir": swell_dir, "swell_height": swell_height, "swell_period": swell_period
         }
 
-        # Build Document In-Memory Stream Buffer
+        st.markdown("---")
+        
+        # --- NEW FRONTEND FEATURE: Webpage Advisory Warning System Callout Box ---
+        if adv_yn == "Y":
+            st.error(f"⚠️ **ACTIVE MARINE ADVISORY DETECTED:** {adv_type}")
+            with st.expander("👀 View Full National Weather Service Bulletin"):
+                st.code(advisory_full_text, language="text")
+        else:
+            st.info("ℹ️ No active NWS small craft or marine weather alerts detected for this area.")
+
+        if all_met is True:
+            st.success("✅ **All Safety Criteria Passed.** Single Coach signature required.")
+        elif all_met is False:
+            st.warning("🚨 **Safety Threshold Exceeded.** Requires BOTH Coach & Program Director approval to clear.")
+        else:
+            st.warning("⚠️ **Data Incomplete.** Please verify conditions manually before signing.")
+
         pdf_buffer = io.BytesIO()
         build_pdf(pdf_buffer, payload, checks, all_met)
         pdf_buffer.seek(0)
 
-        # Display Final System Verdict UI Status Card
-        st.markdown("---")
-        if all_met is True:
-            st.success("✅ **All Safety Criteria Passed.** Single Coach signature required.")
-        elif all_met is False:
-            st.error("🚨 **Safety Threshold Exceeded.** Requires BOTH Coach & Program Director approval.")
-        else:
-            st.warning("⚠️ **Data Incomplete.** Please verify conditions manually before signing.")
-
-        # Render Native Download Asset Link Action
         st.download_button(
-            label="⬇️ Download Completed Checklist PDF",
+            label="⬇️ Download Completed Checklist PDF (Includes Detailed Advisories on Page 2)",
             data=pdf_buffer,
             file_name=f"SCYC_Harbor_Checklist_{date_str.replace('/', '-')}.pdf",
             mime="application/pdf",
