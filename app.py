@@ -275,7 +275,6 @@ def evaluate(level, class_name, wind_harbor, sounding, advisory, wave_state, ret
     c = CRITERIA[level]
     wmax = c["fj_wind_max"] if (level == "advanced" and class_name == "FJ") else c["wind_max"]
     
-    # Strictly evaluate the mathematical reality of all checklist rows
     return {
         "advisory": ("No Small Craft, Swell, or Fog Advisory", None if advisory is None else advisory.upper() == "N"),
         "sounding": (f"Harbor mouth sounding \u2265 {c['sounding_min']}ft", None if sounding is None else sounding >= c["sounding_min"]),
@@ -343,8 +342,18 @@ def build_pdf(target, data_dict, checks_dict, approval_status):
     y -= 4
 
     section("Tide  (NOAA Tides & Currents)")
-    line("High Tide / Feet", f"{data_dict['high_time']} / {data_dict['high_ft']} ft" if data_dict['high_time'] else None, data_dict['high_time'] is None)
-    line("Low Tide / Feet", f"{data_dict['low_time']} / {data_dict['low_ft']} ft" if data_dict['low_time'] else None, data_dict['low_time'] is None)
+    
+    # Process high/low values cleanly using fallback logic markers
+    h_time = data_dict.get('high_time')
+    h_ft = data_dict.get('high_ft')
+    h_display = f"{h_time or '???'} / {h_ft if h_ft is not None else '???'} ft" if (h_time or h_ft is not None) else None
+    line("High Tide / Feet", h_display, not h_time or h_ft is None)
+
+    l_time = data_dict.get('low_time')
+    l_ft = data_dict.get('low_ft')
+    l_display = f"{l_time or '???'} / {l_ft if l_ft is not None else '???'} ft" if (l_time or l_ft is not None) else None
+    line("Low Tide / Feet", l_display, not l_time or l_ft is None)
+    
     line("Leaving time", data_dict['leave'])
     line("Return time", data_dict['ret'])
     if data_dict['tide_at_return'] is not None:
@@ -352,7 +361,7 @@ def build_pdf(target, data_dict, checks_dict, approval_status):
         line("Predicted tide @ return", f"{data_dict['tide_at_return']} ft" + ("  <- NEGATIVE TIDE" if neg else ""), neg)
     y -= 4
 
-    section("Sea / Swell State @ Harbor Mouth  (wave state: manual check; swell dir/ht/period: API, verify)")
+    section("Sea / Swell State @ Harbor Mouth")
     wave_label = {"none": "No Waves", "half": "Waves breaking, half way", "full": "Wave breaking ALL the way across"}.get(data_dict['wave_state'], "Not Checked")
     line("Wave state", wave_label, data_dict['wave_state'] is None)
     line("Swell direction", data_dict['swell_dir'], data_dict['swell_dir'] is None)
@@ -384,7 +393,6 @@ def build_pdf(target, data_dict, checks_dict, approval_status):
     c.drawString(x0, y, "[X] = meets criteria   [ ] = does NOT meet criteria")
     y -= 16
 
-    # Draw checkboxes dynamically using true validation statuses
     for key, (text, met) in checks_dict.items():
         draw_checkbox(c, x0 + 0.15 * inch, y - 7, met)
         c.setFont("Helvetica", 10)
@@ -394,7 +402,6 @@ def build_pdf(target, data_dict, checks_dict, approval_status):
     y -= 6
     c.setFont("Helvetica-Bold", 10)
     
-    # Audit trail validation mapping labels
     if approval_status == "passed_exit":
         c.setFillColor(colors.green)
         c.drawString(x0, y, "All criteria met - single Coach signature required to exit harbor.")
@@ -435,7 +442,6 @@ def build_pdf(target, data_dict, checks_dict, approval_status):
     c.setFont("Helvetica-Oblique", 7)
     c.drawString(x0, y, f"Auto-generated {datetime.now().strftime('%m/%d/%Y %I:%M %p')} | Harbor_Exit_Procedure_v_5")
 
-    # --- PAGE 2: DETAILED NWS ADVISORY TEXT ---
     if data_dict.get("advisory_full_text"):
         c.showPage()
         y_p2 = H - 0.6 * inch
@@ -505,11 +511,22 @@ wave_state = st.selectbox(
     index=0
 )
 
+# Refactored Manual Override Grid System
 with st.expander("⚠️ Manual API Overrides (Use if Government Servers Timeout)"):
-    st.markdown("*Leave these empty to allow the script to automatically fetch live environmental data.*")
-    m_high_tide = st.text_input("Manual High Tide Time & Height (e.g., 11:30 AM / 4.5 ft)")
-    m_low_tide = st.text_input("Manual Low Tide Time & Height (e.g., 5:15 PM / -0.2 ft)")
-    m_ret_tide = st.text_input("Manual Tide Height at Return Time (ft)", value="")
+    st.markdown("*Leave these fields empty to use live data pulled from NOAA and marine models.*")
+    
+    tide_col1, tide_col2 = st.columns(2)
+    with tide_col1:
+        st.markdown("**[▲] High Tide Override**")
+        m_high_time = st.text_input("High Tide Time (e.g., 11:30 AM)", key="m_h_time")
+        m_high_height = st.text_input("High Tide Height (ft) (e.g., 4.5)", key="m_h_hgt")
+    with tide_col2:
+        st.markdown("**[▼] Low Tide Override**")
+        m_low_time = st.text_input("Low Tide Time (e.g., 5:15 PM)", key="m_l_time")
+        m_low_height = st.text_input("Low Tide Height (ft) (e.g., -0.2)", key="m_l_hgt")
+        
+    st.markdown("---")
+    m_ret_tide = st.text_input("Manual Tide Height at Return Time (ft)", value="", key="m_r_hgt")
 
 if st.button("Generate Checklist PDF", type="primary"):
     date_str = sailing_date.strftime("%m/%d/%Y")
@@ -520,16 +537,25 @@ if st.button("Generate Checklist PDF", type="primary"):
         tide = parse_tide_summary(tide_events, date_str, leave_time, return_time)
         tide_at_return = estimate_tide_at(tide_events, date_str, return_time)
         
-        if m_high_tide:
-            tide["high_time"], tide["high_ft"] = m_high_tide.split("/") if "/" in m_high_tide else (m_high_tide, "Unknown")
-        if m_low_tide:
-            tide["low_time"], tide["low_ft"] = m_low_tide.split("/") if "/" in m_low_tide else (m_low_tide, "Unknown")
-        if m_ret_tide:
+        # Intercept and append granular text inputs if provided by the user
+        if m_high_time:
+            tide["high_time"] = m_high_time
+        if m_high_height.strip():
+            try: tide["high_ft"] = float(m_high_height)
+            except ValueError: tide["high_ft"] = m_high_height
+            
+        if m_low_time:
+            tide["low_time"] = m_low_time
+        if m_low_height.strip():
+            try: tide["low_ft"] = float(m_low_height)
+            except ValueError: tide["low_ft"] = m_low_height
+            
+        if m_ret_tide.strip():
             try: tide_at_return = float(m_ret_tide)
             except ValueError: pass
 
-        if not tide_events and not m_high_tide:
-            st.warning("⚠️ NOAA Tide API timed out. Consider filling out the Manual Overrides menu above.")
+        if not tide_events and not m_high_time and not m_high_height:
+            st.warning("⚠️ NOAA Tide API timed out. Grid parameters must be manually filled above.")
 
         wind_harbor = fetch_wind_window(date_str, leave_time, return_time)
         wind_buoy = wind_harbor
@@ -548,25 +574,20 @@ if st.button("Generate Checklist PDF", type="primary"):
         elif level != "advanced" and tide.get("absolute_low_day_ft") is not None:
             returning_ok = tide["absolute_low_day_ft"] >= 0
 
-        # Execute absolute calculations
         checks_dict = evaluate(level, boat_class, wind_harbor, sounding_input, adv_yn, wave_state, returning_ok, aqi)
         
-        # Smart override routing rule analysis
         director_required = False
         inside_failed = False
         
         for key, (text, met) in checks_dict.items():
             if met is False:
                 if exiting_bool:
-                    # Exiting requires a clean sweep across all categories
                     director_required = True
                 else:
-                    # Inside practice only escalates signature if core fields fail
                     if key in ["wind", "aqi", "advisory"]:
                         director_required = True
                         inside_failed = True
 
-        # Assign conditional statuses for reporting maps
         if exiting_bool:
             approval_status = "failed_exit" if director_required else "passed_exit"
         else:
@@ -592,7 +613,6 @@ if st.button("Generate Checklist PDF", type="primary"):
         else:
             st.info("ℹ️ No active NWS small craft or marine weather alerts detected for this area.")
 
-        # Display smart UI notices reflecting true operational boundaries
         if approval_status == "passed_exit":
             st.success("✅ **All Safety Criteria Passed.** Single Coach signature required to exit harbor.")
         elif approval_status == "passed_inside":
