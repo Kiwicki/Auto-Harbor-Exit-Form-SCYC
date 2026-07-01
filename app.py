@@ -271,35 +271,19 @@ def fetch_advisory():
     except Exception:
         return None, None, None
 
-def evaluate(level, class_name, wind_harbor, sounding, advisory, wave_state, returning_ok, aqi, exiting_harbor):
+def evaluate(level, class_name, wind_harbor, sounding, advisory, wave_state, returning_ok, aqi):
     c = CRITERIA[level]
-    
-    # Core checks that always apply regardless of boundary lines
-    checks = [
-        ("No Small Craft, Swell, or Fog Advisory", None if advisory is None else advisory.upper() == "N"),
-    ]
-    
-    # Dynamically toggle checks based on the layout decision button
-    if exiting_harbor:
-        checks.append((f"Harbor mouth sounding \u2265 {c['sounding_min']}ft", None if sounding is None else sounding >= c["sounding_min"]))
-        if level == "advanced":
-            checks.append(("NOT returning in \u2264 8ft depth", returning_ok))
-        else:
-            checks.append(("NOT returning on negative tide", returning_ok))
-        checks.append(("Harbor mouth wave cresting \u2264 half the channel", None if wave_state is None else wave_state in ("none", "half")))
-    else:
-        # If staying inside, channel boundary conditions automatically clear
-        checks.append((f"Harbor mouth sounding (Bypassed - Staying Inside)", True))
-        if level == "advanced":
-            checks.append(("NOT returning in \u2264 8ft depth (Bypassed - Staying Inside)", True))
-        else:
-            checks.append(("NOT returning on negative tide (Bypassed - Staying Inside)", True))
-        checks.append(("Harbor mouth wave cresting (Bypassed - Staying Inside)", True))
-
     wmax = c["fj_wind_max"] if (level == "advanced" and class_name == "FJ") else c["wind_max"]
-    checks.append((f"Predicted Wind \u2264{wmax} kn", None if wind_harbor is None else wind_harbor <= wmax))
-    checks.append(("AQI \u2264 100ppm", None if aqi is None else aqi <= 100))
-    return checks
+    
+    # Strictly evaluate the mathematical reality of all checklist rows
+    return {
+        "advisory": ("No Small Craft, Swell, or Fog Advisory", None if advisory is None else advisory.upper() == "N"),
+        "sounding": (f"Harbor mouth sounding \u2265 {c['sounding_min']}ft", None if sounding is None else sounding >= c["sounding_min"]),
+        "returning": ("NOT returning in \u2264 8ft depth" if level == "advanced" else "NOT returning on negative tide", returning_ok),
+        "wave_state": ("Harbor mouth wave cresting \u2264 half the channel", None if wave_state is None else wave_state in ("none", "half")),
+        "wind": (f"Predicted Wind \u2264{wmax} kn", None if wind_harbor is None else wind_harbor <= wmax),
+        "aqi": ("AQI \u2264 100ppm", None if aqi is None else aqi <= 100)
+    }
 
 # ---------------------------------------------------------------------------
 # PDF Generation Canvas Engine
@@ -312,7 +296,7 @@ def draw_checkbox(c, x, y, checked):
         c.drawString(x + 1.3, y + 1, "X")
     c.restoreState()
 
-def build_pdf(target, data_dict, checks, all_met):
+def build_pdf(target, data_dict, checks_dict, approval_status):
     c = canvas.Canvas(target, pagesize=letter)
     W, H = letter
     x0 = 0.6 * inch
@@ -354,7 +338,7 @@ def build_pdf(target, data_dict, checks, all_met):
         y -= 15
 
     section("Wind Speed  (SailFlow / PredictWind / SC Harbor / 1 Mile Buoy)")
-    line("@ Harbor Mouth (Max in Window)", f"{data_dict['wind_harbor']} kn" if data_dict['wind_harbor'] is not None else None, data_dict['wind_harbor'] is None)
+    line("Max Predicted Wind in Window", f"{data_dict['wind_harbor']} kn" if data_dict['wind_harbor'] is not None else None, data_dict['wind_harbor'] is None)
     line("@ Mile Buoy (Max in Window)", f"{data_dict['wind_buoy']} kn" if data_dict['wind_buoy'] is not None else None, data_dict['wind_buoy'] is None)
     y -= 4
 
@@ -370,14 +354,14 @@ def build_pdf(target, data_dict, checks, all_met):
 
     section("Sea / Swell State @ Harbor Mouth  (wave state: manual check; swell dir/ht/period: API, verify)")
     wave_label = {"none": "No Waves", "half": "Waves breaking, half way", "full": "Wave breaking ALL the way across"}.get(data_dict['wave_state'], "Not Checked")
-    line("Wave state", wave_label if data_dict['exiting'] else "N/A - Staying Inside", data_dict['wave_state'] is None and data_dict['exiting'])
-    line("Swell direction", data_dict['swell_dir'] if data_dict['exiting'] else "N/A", data_dict['swell_dir'] is None and data_dict['exiting'])
-    line("Swell height", f"{data_dict['swell_height']} ft" if (data_dict['swell_height'] is not None and data_dict['exiting']) else "N/A", data_dict['swell_height'] is None and data_dict['exiting'])
-    line("Swell period", f"{data_dict['swell_period']} sec" if (data_dict['swell_period'] is not None and data_dict['exiting']) else "N/A", data_dict['swell_period'] is None and data_dict['exiting'])
+    line("Wave state", wave_label, data_dict['wave_state'] is None)
+    line("Swell direction", data_dict['swell_dir'], data_dict['swell_dir'] is None)
+    line("Swell height", f"{data_dict['swell_height']} ft" if data_dict['swell_height'] is not None else None, data_dict['swell_height'] is None)
+    line("Swell period", f"{data_dict['swell_period']} sec" if data_dict['swell_period'] is not None else None, data_dict['swell_period'] is None)
     y -= 4
 
     section("Harbor Advisory Status  (sounding = manual check required)")
-    line("Harbor mouth sounding", f"{data_dict['sounding']} ft" if data_dict['sounding'] is not None else None, data_dict['sounding'] is None and data_dict['exiting'])
+    line("Harbor mouth sounding", f"{data_dict['sounding']} ft" if data_dict['sounding'] is not None else None, data_dict['sounding'] is None)
     line("NOAA Advisory (Y/N)", data_dict['advisory'], data_dict['advisory'] is None)
     if data_dict['advisory_type']:
         line("Advisory type", data_dict['advisory_type'])
@@ -400,7 +384,8 @@ def build_pdf(target, data_dict, checks, all_met):
     c.drawString(x0, y, "[X] = meets criteria   [ ] = does NOT meet criteria")
     y -= 16
 
-    for text, met in checks:
+    # Draw checkboxes dynamically using true validation statuses
+    for key, (text, met) in checks_dict.items():
         draw_checkbox(c, x0 + 0.15 * inch, y - 7, met)
         c.setFont("Helvetica", 10)
         c.drawString(x0 + 0.4 * inch, y - 6, text)
@@ -408,12 +393,21 @@ def build_pdf(target, data_dict, checks, all_met):
 
     y -= 6
     c.setFont("Helvetica-Bold", 10)
-    if all_met is True:
+    
+    # Audit trail validation mapping labels
+    if approval_status == "passed_exit":
         c.setFillColor(colors.green)
-        c.drawString(x0, y, "All criteria met - single Coach signature required.")
-    elif all_met is False:
+        c.drawString(x0, y, "All criteria met - single Coach signature required to exit harbor.")
+    elif approval_status == "passed_inside":
+        c.setFillColor(colors.green)
+        c.drawString(x0, y, "Practice restricted to INSIDE. Harbor mouth criteria not met, Coach signature authorized.")
+    elif approval_status == "failed_inside":
         c.setFillColor(colors.red)
-        c.drawString(x0, y, "One or more criteria NOT met - BOTH Coach & Director approval required.")
+        c.drawString(x0, y, "Inside thresholds exceeded (Wind/AQI/Alert) - BOTH Coach & Director approval required.")
+    else:
+        c.setFillColor(colors.red)
+        c.drawString(x0, y, "One or more criteria NOT met - BOTH Coach & Director approval required to exit harbor.")
+        
     c.setFillColor(colors.black)
     y -= 28
 
@@ -439,7 +433,7 @@ def build_pdf(target, data_dict, checks, all_met):
     c.drawString(x0, y, "Harbormaster (if sounding <12ft or advisory active): (831) 475-6161")
     y -= 16
     c.setFont("Helvetica-Oblique", 7)
-    c.drawString(x0, y, f"Auto-generated {datetime.now().strftime('%m/%d/%Y %I:%M %p')} | Harbor_Exit_Procedure_v_4")
+    c.drawString(x0, y, f"Auto-generated {datetime.now().strftime('%m/%d/%Y %I:%M %p')} | Harbor_Exit_Procedure_v_5")
 
     # --- PAGE 2: DETAILED NWS ADVISORY TEXT ---
     if data_dict.get("advisory_full_text"):
@@ -484,7 +478,6 @@ st.markdown("""
 ---
 """)
 
-# NEW INTERACTIVE ELEMENT: Horizontal choice layout block
 exiting_plan = st.radio(
     "What is today's practice plan?", 
     ["Exiting Harbor", "Not Exiting Harbor (Staying Inside)"], 
@@ -499,27 +492,24 @@ with col1:
     sailing_date = st.date_input("Sailing Date", datetime.now())
     leave_time = st.text_input("Leaving Time", "10:00 AM")
 with col2:
-    # If coach is staying inside, lock down input boxes that don't apply to reduce confusion
     sounding_input = st.number_input(
         "Harbor Mouth Sounding (ft)", 
         min_value=0.0, max_value=30.0, value=12.0, step=0.5,
-        disabled=not exiting_bool,
-        help="Bypassed if staying inside the harbor lines."
+        help="Required for compliance logging even if staying inside harbor lines."
     )
     return_time = st.text_input("Return Time", "2:00 PM")
 
 wave_state = st.selectbox(
     "Wave State at Harbor Mouth", 
     ["none", "half", "full"], 
-    index=0,
-    disabled=not exiting_bool
+    index=0
 )
 
 with st.expander("⚠️ Manual API Overrides (Use if Government Servers Timeout)"):
     st.markdown("*Leave these empty to allow the script to automatically fetch live environmental data.*")
     m_high_tide = st.text_input("Manual High Tide Time & Height (e.g., 11:30 AM / 4.5 ft)")
     m_low_tide = st.text_input("Manual Low Tide Time & Height (e.g., 5:15 PM / -0.2 ft)")
-    m_ret_tide = st.text_input("Manual Tide Height at Return Time (ft)", value="", disabled=not exiting_bool)
+    m_ret_tide = st.text_input("Manual Tide Height at Return Time (ft)", value="")
 
 if st.button("Generate Checklist PDF", type="primary"):
     date_str = sailing_date.strftime("%m/%d/%Y")
@@ -528,13 +518,13 @@ if st.button("Generate Checklist PDF", type="primary"):
     with st.spinner("Fetching live marine data endpoints..."):
         tide_events = fetch_tide_data(date_str)
         tide = parse_tide_summary(tide_events, date_str, leave_time, return_time)
-        tide_at_return = estimate_tide_at(tide_events, date_str, return_time) if exiting_bool else None
+        tide_at_return = estimate_tide_at(tide_events, date_str, return_time)
         
         if m_high_tide:
             tide["high_time"], tide["high_ft"] = m_high_tide.split("/") if "/" in m_high_tide else (m_high_tide, "Unknown")
         if m_low_tide:
             tide["low_time"], tide["low_ft"] = m_low_tide.split("/") if "/" in m_low_tide else (m_low_tide, "Unknown")
-        if m_ret_tide and exiting_bool:
+        if m_ret_tide:
             try: tide_at_return = float(m_ret_tide)
             except ValueError: pass
 
@@ -546,27 +536,41 @@ if st.button("Generate Checklist PDF", type="primary"):
         aqi = fetch_aqi()
         adv_yn, adv_type, advisory_full_text = fetch_advisory()
 
-        # Only run swell logic if they are heading out past the breakwater
-        if exiting_bool:
-            wf = fetch_marine_swell_api(date_str, leave_time, return_time)
-            wf_return = wf.get("return") or {}
-            swell_dir = wf_return.get("wave_dir", "W")
-            swell_height = wf_return.get("wave_height_ft", 3.0)
-            swell_period = wf_return.get("wave_period", 10.0)
-        else:
-            swell_dir, swell_height, swell_period = "N/A", None, None
+        wf = fetch_marine_swell_api(date_str, leave_time, return_time)
+        wf_return = wf.get("return") or {}
+        swell_dir = wf_return.get("wave_dir", "W")
+        swell_height = wf_return.get("wave_height_ft", 3.0)
+        swell_period = wf_return.get("wave_period", 10.0)
 
         returning_ok = None
-        if exiting_bool:
-            if tide_at_return is not None:
-                returning_ok = (sounding_input + tide_at_return) > 8.0 if level == "advanced" else tide_at_return >= 0
-            elif level != "advanced" and tide.get("absolute_low_day_ft") is not None:
-                returning_ok = tide["absolute_low_day_ft"] >= 0
+        if tide_at_return is not None:
+            returning_ok = (sounding_input + tide_at_return) > 8.0 if level == "advanced" else tide_at_return >= 0
+        elif level != "advanced" and tide.get("absolute_low_day_ft") is not None:
+            returning_ok = tide["absolute_low_day_ft"] >= 0
 
-        # Pass the dynamic choice flag straight into the evaluation matrix
-        checks = evaluate(level, boat_class, wind_harbor, sounding_input, adv_yn, wave_state, returning_ok, aqi, exiting_bool)
-        values = [met for _, met in checks]
-        all_met = False if any(v is False for v in values) else (None if any(v is None for v in values) else True)
+        # Execute absolute calculations
+        checks_dict = evaluate(level, boat_class, wind_harbor, sounding_input, adv_yn, wave_state, returning_ok, aqi)
+        
+        # Smart override routing rule analysis
+        director_required = False
+        inside_failed = False
+        
+        for key, (text, met) in checks_dict.items():
+            if met is False:
+                if exiting_bool:
+                    # Exiting requires a clean sweep across all categories
+                    director_required = True
+                else:
+                    # Inside practice only escalates signature if core fields fail
+                    if key in ["wind", "aqi", "advisory"]:
+                        director_required = True
+                        inside_failed = True
+
+        # Assign conditional statuses for reporting maps
+        if exiting_bool:
+            approval_status = "failed_exit" if director_required else "passed_exit"
+        else:
+            approval_status = "failed_inside" if inside_failed else "passed_inside"
 
         payload = {
             "date": date_str, "boat_class": boat_class, "level": level, "leave": leave_time, "ret": return_time,
@@ -588,15 +592,18 @@ if st.button("Generate Checklist PDF", type="primary"):
         else:
             st.info("ℹ️ No active NWS small craft or marine weather alerts detected for this area.")
 
-        if all_met is True:
-            st.success("✅ **All Safety Criteria Passed.** Single Coach signature required.")
-        elif all_met is False:
-            st.error("🚨 **Safety Threshold Exceeded.** Requires BOTH Coach & Program Director approval to clear.")
+        # Display smart UI notices reflecting true operational boundaries
+        if approval_status == "passed_exit":
+            st.success("✅ **All Safety Criteria Passed.** Single Coach signature required to exit harbor.")
+        elif approval_status == "passed_inside":
+            st.success("ℹ️ **Practice Restricted to INSIDE Harbor.** Harbor mouth criteria not met, but inside safety lines are clear. **Single Coach signature required.**")
+        elif approval_status == "failed_inside":
+            st.error("🚨 **CRITICAL INSIDE SAFETY VIOLATION (Wind/AQI/Advisory).** Requires BOTH Coach & Program Director approval to conduct inside practice.")
         else:
-            st.warning("⚠️ **Data Incomplete.** Please verify conditions manually before signing.")
+            st.error("🚨 **Safety Threshold Exceeded.** Requires BOTH Coach & Program Director approval to exit harbor.")
 
         pdf_buffer = io.BytesIO()
-        build_pdf(pdf_buffer, payload, checks, all_met)
+        build_pdf(pdf_buffer, payload, checks_dict, approval_status)
         pdf_buffer.seek(0)
 
         st.download_button(
