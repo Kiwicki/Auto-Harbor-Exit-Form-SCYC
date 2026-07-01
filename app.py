@@ -271,18 +271,31 @@ def fetch_advisory():
     except Exception:
         return None, None, None
 
-def evaluate(level, class_name, wind_harbor, sounding, advisory, wave_state, returning_ok, aqi):
+def evaluate(level, class_name, wind_harbor, sounding, advisory, wave_state, returning_ok, aqi, exiting_harbor):
     c = CRITERIA[level]
+    
+    # Core checks that always apply regardless of boundary lines
     checks = [
         ("No Small Craft, Swell, or Fog Advisory", None if advisory is None else advisory.upper() == "N"),
-        (f"Harbor mouth sounding \u2265 {c['sounding_min']}ft", None if sounding is None else sounding >= c["sounding_min"])
     ]
-    if level == "advanced":
-        checks.append(("NOT returning in \u2264 8ft depth", returning_ok))
+    
+    # Dynamically toggle checks based on the layout decision button
+    if exiting_harbor:
+        checks.append((f"Harbor mouth sounding \u2265 {c['sounding_min']}ft", None if sounding is None else sounding >= c["sounding_min"]))
+        if level == "advanced":
+            checks.append(("NOT returning in \u2264 8ft depth", returning_ok))
+        else:
+            checks.append(("NOT returning on negative tide", returning_ok))
+        checks.append(("Harbor mouth wave cresting \u2264 half the channel", None if wave_state is None else wave_state in ("none", "half")))
     else:
-        checks.append(("NOT returning on negative tide", returning_ok))
+        # If staying inside, channel boundary conditions automatically clear
+        checks.append((f"Harbor mouth sounding (Bypassed - Staying Inside)", True))
+        if level == "advanced":
+            checks.append(("NOT returning in \u2264 8ft depth (Bypassed - Staying Inside)", True))
+        else:
+            checks.append(("NOT returning on negative tide (Bypassed - Staying Inside)", True))
+        checks.append(("Harbor mouth wave cresting (Bypassed - Staying Inside)", True))
 
-    checks.append(("Harbor mouth wave cresting \u2264 half the channel", None if wave_state is None else wave_state in ("none", "half")))
     wmax = c["fj_wind_max"] if (level == "advanced" and class_name == "FJ") else c["wind_max"]
     checks.append((f"Predicted Wind \u2264{wmax} kn", None if wind_harbor is None else wind_harbor <= wmax))
     checks.append(("AQI \u2264 100ppm", None if aqi is None else aqi <= 100))
@@ -357,14 +370,14 @@ def build_pdf(target, data_dict, checks, all_met):
 
     section("Sea / Swell State @ Harbor Mouth  (wave state: manual check; swell dir/ht/period: API, verify)")
     wave_label = {"none": "No Waves", "half": "Waves breaking, half way", "full": "Wave breaking ALL the way across"}.get(data_dict['wave_state'], "Not Checked")
-    line("Wave state", wave_label, data_dict['wave_state'] is None)
-    line("Swell direction", data_dict['swell_dir'], data_dict['swell_dir'] is None)
-    line("Swell height", f"{data_dict['swell_height']} ft" if data_dict['swell_height'] is not None else None, data_dict['swell_height'] is None)
-    line("Swell period", f"{data_dict['swell_period']} sec" if data_dict['swell_period'] is not None else None, data_dict['swell_period'] is None)
+    line("Wave state", wave_label if data_dict['exiting'] else "N/A - Staying Inside", data_dict['wave_state'] is None and data_dict['exiting'])
+    line("Swell direction", data_dict['swell_dir'] if data_dict['exiting'] else "N/A", data_dict['swell_dir'] is None and data_dict['exiting'])
+    line("Swell height", f"{data_dict['swell_height']} ft" if (data_dict['swell_height'] is not None and data_dict['exiting']) else "N/A", data_dict['swell_height'] is None and data_dict['exiting'])
+    line("Swell period", f"{data_dict['swell_period']} sec" if (data_dict['swell_period'] is not None and data_dict['exiting']) else "N/A", data_dict['swell_period'] is None and data_dict['exiting'])
     y -= 4
 
     section("Harbor Advisory Status  (sounding = manual check required)")
-    line("Harbor mouth sounding", f"{data_dict['sounding']} ft" if data_dict['sounding'] is not None else None, data_dict['sounding'] is None)
+    line("Harbor mouth sounding", f"{data_dict['sounding']} ft" if data_dict['sounding'] is not None else None, data_dict['sounding'] is None and data_dict['exiting'])
     line("NOAA Advisory (Y/N)", data_dict['advisory'], data_dict['advisory'] is None)
     if data_dict['advisory_type']:
         line("Advisory type", data_dict['advisory_type'])
@@ -400,7 +413,7 @@ def build_pdf(target, data_dict, checks, all_met):
         c.drawString(x0, y, "All criteria met - single Coach signature required.")
     elif all_met is False:
         c.setFillColor(colors.red)
-        c.drawString(x0, y, "One or more criteria NOT met - BOTH Coach & Director approval required to exit.")
+        c.drawString(x0, y, "One or more criteria NOT met - BOTH Coach & Director approval required.")
     c.setFillColor(colors.black)
     y -= 28
 
@@ -430,7 +443,7 @@ def build_pdf(target, data_dict, checks, all_met):
 
     # --- PAGE 2: DETAILED NWS ADVISORY TEXT ---
     if data_dict.get("advisory_full_text"):
-        c.showPage()  # Commit Page 1 and generate Page 2 canvas
+        c.showPage()
         y_p2 = H - 0.6 * inch
         
         c.setFont("Helvetica-Bold", 14)
@@ -440,7 +453,6 @@ def build_pdf(target, data_dict, checks, all_met):
         c.line(x0, y_p2, W - x0, y_p2)
         y_p2 -= 20
         
-        # Configure wrapping paragraph styling container rules
         styles = getSampleStyleSheet()
         alert_style = ParagraphStyle(
             'NWSAlertStyle',
@@ -451,11 +463,8 @@ def build_pdf(target, data_dict, checks, all_met):
             textColor=colors.HexColor("#222222")
         )
         
-        # Format clean spacing layouts for paragraphs
         formatted_text = data_dict["advisory_full_text"].replace("\n", "<br/>")
         p = Paragraph(formatted_text, alert_style)
-        
-        # Draw paragraph bound to specific width dimensions
         p.wrapOn(c, W - 2*x0, H - 2*inch)
         p.drawOn(c, x0, y_p2 - p.height)
 
@@ -475,39 +484,57 @@ st.markdown("""
 ---
 """)
 
+# NEW INTERACTIVE ELEMENT: Horizontal choice layout block
+exiting_plan = st.radio(
+    "What is today's practice plan?", 
+    ["Exiting Harbor", "Not Exiting Harbor (Staying Inside)"], 
+    index=0, 
+    horizontal=True
+)
+exiting_bool = True if exiting_plan == "Exiting Harbor" else False
+
 col1, col2 = st.columns(2)
 with col1:
     boat_class = st.selectbox("Boat Class", list(CLASS_TO_LEVEL_DEFAULT.keys()))
     sailing_date = st.date_input("Sailing Date", datetime.now())
     leave_time = st.text_input("Leaving Time", "10:00 AM")
 with col2:
-    exiting_plan = st.radio("Plan", ["Exiting Harbor", "Not Exiting Harbor"], index=0)
-    sounding_input = st.number_input("Harbor Mouth Sounding (ft)", min_value=0.0, max_value=30.0, value=12.0, step=0.5)
+    # If coach is staying inside, lock down input boxes that don't apply to reduce confusion
+    sounding_input = st.number_input(
+        "Harbor Mouth Sounding (ft)", 
+        min_value=0.0, max_value=30.0, value=12.0, step=0.5,
+        disabled=not exiting_bool,
+        help="Bypassed if staying inside the harbor lines."
+    )
     return_time = st.text_input("Return Time", "2:00 PM")
 
-wave_state = st.selectbox("Wave State at Harbor Mouth", ["none", "half", "full"], index=0)
+wave_state = st.selectbox(
+    "Wave State at Harbor Mouth", 
+    ["none", "half", "full"], 
+    index=0,
+    disabled=not exiting_bool
+)
 
 with st.expander("⚠️ Manual API Overrides (Use if Government Servers Timeout)"):
     st.markdown("*Leave these empty to allow the script to automatically fetch live environmental data.*")
     m_high_tide = st.text_input("Manual High Tide Time & Height (e.g., 11:30 AM / 4.5 ft)")
     m_low_tide = st.text_input("Manual Low Tide Time & Height (e.g., 5:15 PM / -0.2 ft)")
-    m_ret_tide = st.text_input("Manual Tide Height at Return Time (ft)", value="")
+    m_ret_tide = st.text_input("Manual Tide Height at Return Time (ft)", value="", disabled=not exiting_bool)
 
 if st.button("Generate Checklist PDF", type="primary"):
     date_str = sailing_date.strftime("%m/%d/%Y")
     level = CLASS_TO_LEVEL_DEFAULT[boat_class]
-    exiting_bool = True if exiting_plan == "Exiting Harbor" else False
 
     with st.spinner("Fetching live marine data endpoints..."):
         tide_events = fetch_tide_data(date_str)
         tide = parse_tide_summary(tide_events, date_str, leave_time, return_time)
-        tide_at_return = estimate_tide_at(tide_events, date_str, return_time)
+        tide_at_return = estimate_tide_at(tide_events, date_str, return_time) if exiting_bool else None
         
         if m_high_tide:
             tide["high_time"], tide["high_ft"] = m_high_tide.split("/") if "/" in m_high_tide else (m_high_tide, "Unknown")
         if m_low_tide:
             tide["low_time"], tide["low_ft"] = m_low_tide.split("/") if "/" in m_low_tide else (m_low_tide, "Unknown")
-        if m_ret_tide:
+        if m_ret_tide and exiting_bool:
             try: tide_at_return = float(m_ret_tide)
             except ValueError: pass
 
@@ -517,23 +544,27 @@ if st.button("Generate Checklist PDF", type="primary"):
         wind_harbor = fetch_wind_window(date_str, leave_time, return_time)
         wind_buoy = wind_harbor
         aqi = fetch_aqi()
-        
-        # Grab active alert headers and the full body paragraphs from NWS
         adv_yn, adv_type, advisory_full_text = fetch_advisory()
 
-        wf = fetch_marine_swell_api(date_str, leave_time, return_time)
-        wf_return = wf.get("return") or {}
-        swell_dir = wf_return.get("wave_dir", "W")
-        swell_height = wf_return.get("wave_height_ft", 3.0)
-        swell_period = wf_return.get("wave_period", 10.0)
+        # Only run swell logic if they are heading out past the breakwater
+        if exiting_bool:
+            wf = fetch_marine_swell_api(date_str, leave_time, return_time)
+            wf_return = wf.get("return") or {}
+            swell_dir = wf_return.get("wave_dir", "W")
+            swell_height = wf_return.get("wave_height_ft", 3.0)
+            swell_period = wf_return.get("wave_period", 10.0)
+        else:
+            swell_dir, swell_height, swell_period = "N/A", None, None
 
         returning_ok = None
-        if tide_at_return is not None:
-            returning_ok = (sounding_input + tide_at_return) > 8.0 if level == "advanced" else tide_at_return >= 0
-        elif level != "advanced" and tide.get("absolute_low_day_ft") is not None:
-            returning_ok = tide["absolute_low_day_ft"] >= 0
+        if exiting_bool:
+            if tide_at_return is not None:
+                returning_ok = (sounding_input + tide_at_return) > 8.0 if level == "advanced" else tide_at_return >= 0
+            elif level != "advanced" and tide.get("absolute_low_day_ft") is not None:
+                returning_ok = tide["absolute_low_day_ft"] >= 0
 
-        checks = evaluate(level, boat_class, wind_harbor, sounding_input, adv_yn, wave_state, returning_ok, aqi)
+        # Pass the dynamic choice flag straight into the evaluation matrix
+        checks = evaluate(level, boat_class, wind_harbor, sounding_input, adv_yn, wave_state, returning_ok, aqi, exiting_bool)
         values = [met for _, met in checks]
         all_met = False if any(v is False for v in values) else (None if any(v is None for v in values) else True)
 
@@ -550,7 +581,6 @@ if st.button("Generate Checklist PDF", type="primary"):
 
         st.markdown("---")
         
-        # --- NEW FRONTEND FEATURE: Webpage Advisory Warning System Callout Box ---
         if adv_yn == "Y":
             st.error(f"⚠️ **ACTIVE MARINE ADVISORY DETECTED:** {adv_type}")
             with st.expander("👀 View Full National Weather Service Bulletin"):
@@ -561,7 +591,7 @@ if st.button("Generate Checklist PDF", type="primary"):
         if all_met is True:
             st.success("✅ **All Safety Criteria Passed.** Single Coach signature required.")
         elif all_met is False:
-            st.warning("🚨 **Safety Threshold Exceeded.** Requires BOTH Coach & Program Director approval to clear.")
+            st.error("🚨 **Safety Threshold Exceeded.** Requires BOTH Coach & Program Director approval to clear.")
         else:
             st.warning("⚠️ **Data Incomplete.** Please verify conditions manually before signing.")
 
@@ -570,7 +600,7 @@ if st.button("Generate Checklist PDF", type="primary"):
         pdf_buffer.seek(0)
 
         st.download_button(
-            label="⬇️ Download Completed Checklist PDF (Includes Detailed Advisories on Page 2)",
+            label="⬇️ Download Completed Checklist PDF",
             data=pdf_buffer,
             file_name=f"SCYC_Harbor_Checklist_{date_str.replace('/', '-')}.pdf",
             mime="application/pdf",
