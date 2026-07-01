@@ -425,7 +425,14 @@ def build_pdf(target, data_dict, checks, all_met):
 st.set_page_config(page_title="SCYC Harbor Exit Tool", page_icon="⛵", layout="centered")
 
 st.title("⛵ SCYC Harbor Exit Checklist")
-st.markdown("Automated generation form for Santa Cruz Yacht Club coaching workflows.")
+
+# Official Santa Cruz Harbor Resource Links
+st.markdown("""
+**Official Harbor Links:**
+* 📏 [Santa Cruz Harbor Entrance Soundings](https://www.santacruzharbor.org/entrance-sounding)
+* 📹 [Santa Cruz Harbor Webcam](https://www.santacruzharbor.org/santa-cruz-harbor-webcam)
+---
+""")
 
 # Primary Input Forms
 col1, col2 = st.columns(2)
